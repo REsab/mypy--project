@@ -3,7 +3,7 @@ import time
 import subprocess
 import cv2
 import numpy as np
-import random  # 引入随机数模块
+import random
 
 # ================= 配置区 =================
 # ADB 路径需指向你 Mac 上的具体位置
@@ -11,18 +11,17 @@ ADB_PATH = "/Users/resab/mac/scrcpy-macos-x86_64-v3.3.1/adb"
 APP_PACKAGE = "com.luna.music"
 APP_ACTIVITY = "com.luna.biz.main.main.MainActivity"
 
-# 固定坐标点：首页的“免费听歌”入口
-COORD_FREE_VIP = (818, 182)
-# 保底位：通常是屏幕右上角的关闭位置
-COORD_CLOSE_SAFE = (1050, 185)
-
 # 图像素材配置
-IMG_DIR = "img"
+IMG_DIR = "img-k80"
 TEMPLATES = {
-    "reward": os.path.join(IMG_DIR, "领取奖励.png"),
+    "reward": os.path.join(IMG_DIR, "领取奖励.png"),  # 需更新为“继续观看”或“领取奖励”的截图
     "success": os.path.join(IMG_DIR, "领取成功.png"),
     "playing": os.path.join(IMG_DIR, "秒后可领取奖励.png")
 }
+
+# 屏幕参数（脚本启动后会自动通过 ADB 更新）
+SCREEN_W = 1280
+SCREEN_H = 2768
 
 
 # =========================================
@@ -32,143 +31,128 @@ def run_adb(command):
     return subprocess.run(f"{ADB_PATH} {command}", shell=True, capture_output=True)
 
 
+def update_screen_size():
+    """动态获取手机分辨率以适配不同机型"""
+    global SCREEN_W, SCREEN_H
+    res = run_adb("shell wm size")
+    output = res.stdout.decode('utf-8')
+    if "size:" in output:
+        size_str = output.split("size: ")[1].strip()
+        SCREEN_W, SCREEN_H = map(int, size_str.split('x'))
+        print(f"[SYSTEM] 检测到设备分辨率: {SCREEN_W}x{SCREEN_H}")
+
+
+def get_ratio_pos(w_ratio, h_ratio):
+    """根据比例计算绝对坐标，解决新手机适配问题"""
+    return (int(SCREEN_W * w_ratio), int(SCREEN_H * h_ratio))
+
+
 def random_tap(x, y, w, h):
-    """
-    在目标范围内执行随机点击
-    x, y: 匹配到的中心点
-    w, h: 模板图片的宽高
-    """
-    # 在按钮宽高的 30% 范围内进行随机偏移，确保点击点始终在按钮内
-    offset_x = random.randint(-int(w * 0.3), int(w * 0.3))
-    offset_y = random.randint(-int(h * 0.3), int(h * 0.3))
-
-    final_x = x + offset_x
-    final_y = y + offset_y
-
-    print(f"  [ACTION] 👉 执行点击坐标: ({final_x}, {final_y}) (原始中心: {x}, {y}, 随机偏移: {offset_x}, {offset_y})")
+    """在目标范围内执行随机点击"""
+    offset_x = random.randint(-int(w * 0.2), int(w * 0.2))
+    offset_y = random.randint(-int(h * 0.2), int(h * 0.2))
+    final_x, final_y = x + offset_x, y + offset_y
+    print(f"  [ACTION] 👉 点击坐标: ({final_x}, {final_y})")
     run_adb(f"shell input tap {final_x} {final_y}")
 
 
-def get_screen_pos(name, template_path, threshold=0.85):
-    """
-    核心识别函数：带区域过滤 (ROI) 且返回完整尺寸信息
-    """
-    # 1. 实时截取手机屏幕
+def get_screen_pos(name, template_path, threshold=0.75):
+    """带 ROI 区域过滤的图像识别"""
     run_adb("shell screencap -p /sdcard/screen.png")
     run_adb("pull /sdcard/screen.png .")
 
     screen_rgb = cv2.imread("screen.png")
     template_rgb = cv2.imread(template_path)
+    if screen_rgb is None or template_rgb is None: return None
 
-    if screen_rgb is None or template_rgb is None:
-        return None
-
-    screen_h, screen_w = screen_rgb.shape[:2]
-    temp_h, temp_w = template_rgb.shape[:2]
-
-    # --- 物理区域过滤 (ROI)：只在按钮可能出现的区域寻找，排除干扰 ---
+    # --- 针对长屏手机优化 ROI 比例 ---
     if name == "reward":
-        # 绿色大按钮只出现在下半部分
-        roi_top, roi_bottom = int(screen_h * 0.45), screen_h
+        # 弹窗按钮通常在屏幕中心偏下 (25% - 80% 高度)
+        roi_top, roi_bottom = int(SCREEN_H * 0.25), int(SCREEN_H * 0.8)
     elif name == "playing" or name == "success":
-        # 顶部倒计时和关闭按钮只在顶部区域
-        roi_top, roi_bottom = 0, int(screen_h * 0.35)
+        # 顶部状态信息 (0% - 35% 高度)
+        roi_top, roi_bottom = 0, int(SCREEN_H * 0.35)
     else:
-        roi_top, roi_bottom = 0, screen_h
+        roi_top, roi_bottom = 0, SCREEN_H
 
-    # 裁剪图像：只处理感兴趣的区域
-    screen_roi = screen_rgb[roi_top:roi_bottom, 0:screen_w]
-    screen_gray = cv2.cvtColor(screen_roi, cv2.COLOR_BGR2GRAY)
-    template_gray = cv2.cvtColor(template_rgb, cv2.COLOR_BGR2GRAY)
-
-    # 2. OpenCV 模板匹配
-    res = cv2.matchTemplate(screen_gray, template_gray, cv2.TM_CCOEFF_NORMED)
+    screen_roi = screen_rgb[roi_top:roi_bottom, 0:SCREEN_W]
+    res = cv2.matchTemplate(cv2.cvtColor(screen_roi, cv2.COLOR_BGR2GRAY),
+                            cv2.cvtColor(template_rgb, cv2.COLOR_BGR2GRAY), cv2.TM_CCOEFF_NORMED)
     _, max_val, _, max_loc = cv2.minMaxLoc(res)
 
-    # 动态调整阈值，倒计时文字识别稍放宽
-    current_threshold = 0.75 if name == "playing" else threshold
-
-    if max_val >= current_threshold:
-        print(f"  [LOG] 匹配成功 [{name}]: 相似度 {max_val:.4f}")
-        # 计算全屏坐标
-        center_x = max_loc[0] + temp_w // 2
-        center_y = max_loc[1] + temp_h // 2 + roi_top
-        return (center_x, center_y, temp_w, temp_h)
-
+    if max_val >= threshold:
+        print(f"  [LOG] 命中 [{name}]: 相似度 {max_val:.4f}")
+        h, w = template_rgb.shape[:2]
+        return (max_loc[0] + w // 2, max_loc[1] + h // 2 + roi_top, w, h)
     return None
 
 
-def wait_for_ad_finish(max_wait=70, interval=8):
-    """
-    动态监测广告：每隔 8 秒看一次屏幕，灵活退出
-    """
-    print(f"⏳ 进入动态监测模式 (最大等待 {max_wait}s)...")
+def wait_for_ad_finish(max_wait=70, interval=6):
+    """动态监测广告播放状态"""
+    print(f"⏳ 广告播放监测中...")
     start_time = time.time()
-
     while (time.time() - start_time) < max_wait:
         time.sleep(interval)
-
-        # 如果还在播（有倒计时文字），继续循环
-        if get_screen_pos("playing", TEMPLATES["playing"]):
-            print(f"  [STATUS] 📺 广告还在播放中...")
+        # 识别“秒后可领取奖励”
+        if get_screen_pos("playing", TEMPLATES["playing"], threshold=0.7):
+            print(f"  [STATUS] 📺 广告正在播放...")
             continue
-
-        # 广告结束的两个标志：出现绿按钮或出现“领取成功”
+        # 检查是否出现结束按钮
         if get_screen_pos("reward", TEMPLATES["reward"]) or get_screen_pos("success", TEMPLATES["success"]):
-            print("  [STATUS] ✨ 监测到结算标志，广告提前结束")
+            print("  [STATUS] ✨ 监测到按钮，广告已结束")
             return True
-
-    print("⏰ 到达最大时长，自动退出监测")
     return False
 
 
 def main():
-    print("🚀 汽水音乐自动化脚本启动...")
+    print("🚀 汽水音乐自动化脚本【新手机适配版】启动...")
+    update_screen_size()
     fail_count = 0
 
+    # 比例化计算首页固定坐标
+    # 之前 1080 宽度的 818 坐标对应约 0.75 比例
+    COORD_FREE_VIP = get_ratio_pos(0.75, 0.07)
+    COORD_CLOSE_SAFE = get_ratio_pos(0.92, 0.07)
+
     while True:
-        # 检查 App 是否在前台
+        # 前台检查
         res = run_adb("shell dumpsys window | grep mCurrentFocus")
         if APP_PACKAGE not in str(res.stdout):
-            print("[SYSTEM] App 未在前台，执行强制启动...")
+            print("[SYSTEM] 正在启动 App...")
             run_adb(f"shell am force-stop {APP_PACKAGE}")
-            time.sleep(2)
             run_adb(f"shell am start -n {APP_PACKAGE}/{APP_ACTIVITY}")
-            time.sleep(12)  # 给 12 秒启动时间
+            time.sleep(10)
 
         print("\n--- 轮询扫描状态 ---")
 
-        # 【最高优先级】绿色领取奖励按钮：这意味着可以开始下一轮广告了
+        # 1. 尝试寻找“继续观看/领取奖励”按钮
         res_reward = get_screen_pos("reward", TEMPLATES["reward"])
         if res_reward:
-            print(f"🎯 状态：需要 [领取奖励]")
-            random_tap(*res_reward)  # 使用解包语法传入坐标和宽高
+            random_tap(*res_reward)
             fail_count = 0
-            wait_for_ad_finish()  # 点完奖励，直接进广告动态等待
+            wait_for_ad_finish()
             continue
 
-        # 【次高优先级】领取成功按钮：通常是点击 X 关闭广告后的过渡状态
+        # 2. 尝试寻找“领取成功”或关闭 X
         res_success = get_screen_pos("success", TEMPLATES["success"])
         if res_success:
-            print(f"🎯 状态：广告已领，点击 [领取成功] 关闭...")
             random_tap(*res_success)
             fail_count = 0
-            time.sleep(5)  # 等待 5 秒让“挽留弹窗”出来
+            time.sleep(5)
             continue
 
-        # 【低保逻辑】既没成功也没奖励，尝试点一下首页入口位置
-        print("🔍 屏幕未见目标，尝试保底逻辑...")
+        # 3. 保底逻辑：点击首页入口或清除弹窗
+        print("🔍 未见目标按钮，执行保底点击...")
         run_adb(f"shell input tap {COORD_FREE_VIP[0]} {COORD_FREE_VIP[1]}")
         run_adb(f"shell input tap {COORD_CLOSE_SAFE[0]} {COORD_CLOSE_SAFE[1]}")
 
         fail_count += 1
-        if fail_count >= 6:  # 连续 1 分钟没反应就重启
-            print("❌ 连续卡死，执行重启程序...")
-            fail_count = 0
-            # 重启逻辑会由下次循环头部的“前台检测”触发
+        if fail_count >= 8:  # 约 1.5 分钟无响应则重启
+            print("❌ 脚本卡死，强制重启中...")
             run_adb(f"shell am force-stop {APP_PACKAGE}")
+            fail_count = 0
 
-        time.sleep(5)
+        time.sleep(6)
 
 
 if __name__ == "__main__":
