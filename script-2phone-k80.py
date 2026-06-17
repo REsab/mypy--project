@@ -61,21 +61,36 @@ def capture_screen():
     run_adb("pull /sdcard/screen.png .")
     return cv2.imread("screen.png")
 
-
 def match_template_in_img(screen_rgb, name, template_path, threshold=0.72):
-    """全屏图像识别（降低阈值至0.72提高抗干扰能力）"""
+    """带高度过滤的全屏图像识别，彻底无视屏幕底部 20% 的误导区域"""
     template_rgb = cv2.imread(template_path)
     if screen_rgb is None or template_rgb is None:
         return None
 
-    # 直接全屏扫描，防止长屏 ROI 错位
-    res = cv2.matchTemplate(cv2.cvtColor(screen_rgb, cv2.COLOR_BGR2GRAY),
+    # ======= 核心防误触过滤 =======
+    # 如果是状态、按钮或弹窗文本，只在屏幕高度的 0% 到 80% 之间识别，过滤掉底部 20% 的安全隐患区
+    if name in ["reward", "action_reward", "free_listen"]:
+        roi_top = 0
+        roi_bottom = int(SCREEN_H * 0.80)  # 👈 1280x2768 的手机，只识别到 2214 像素高，以下全部丢弃
+    else:
+        # 其他状态（如 playing 或 success）保持默认范围
+        roi_top = 0
+        roi_bottom = SCREEN_H
+
+    # 切割画面
+    screen_roi = screen_rgb[roi_top:roi_bottom, 0:SCREEN_W]
+
+    res = cv2.matchTemplate(cv2.cvtColor(screen_roi, cv2.COLOR_BGR2GRAY),
                             cv2.cvtColor(template_rgb, cv2.COLOR_BGR2GRAY), cv2.TM_CCOEFF_NORMED)
     _, max_val, _, max_loc = cv2.minMaxLoc(res)
 
+    # 打印扫描明细，带上坐标信息方便观察
+    print(f"    [🔍 扫描明细] 模板 [{name:<13}] -> 最大相似度: {max_val:.4f} (基于安全区域扫描)")
+
     if max_val >= threshold:
         h, w = template_rgb.shape[:2]
-        return (max_loc[0] + w // 2, max_loc[1] + h // 2, w, h, max_val)
+        # 注意：这里的 Y 坐标需要加上 roi_top 还原回全屏坐标
+        return (max_loc[0] + w // 2, max_loc[1] + h // 2 + roi_top, w, h, max_val)
     return None
 
 
